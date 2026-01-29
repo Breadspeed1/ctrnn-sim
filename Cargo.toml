@@ -1,0 +1,3 @@
+[workspace]
+members = ["mnist-sim", "sim-core", "viz-bevy"]
+resolver = "2"
