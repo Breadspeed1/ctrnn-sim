@@ -18,14 +18,14 @@ pub trait AgentBrain<B: Backend, S, const INS: usize, const OUTS: usize> {
     /// fitness: [A, B]
     fn mutate(&mut self, fitness: Tensor<B, 2>);
 
-    fn init_state(&self) -> S;
+    fn init_state(&self, par_sims: usize) -> S;
 }
 
 pub trait Environment<B: Backend, S, const INS: usize, const OUTS: usize> {
     fn input_size(&self) -> usize;
     fn output_size(&self) -> usize;
 
-    fn reset(&mut self, batch_size: usize);
+    fn reset(&mut self, batch_size: usize, concurrent_sims: usize);
 
     fn get_sensors(&self) -> Tensor<B, 3>;
 
@@ -51,6 +51,7 @@ pub struct Runner<B, ES, BS, E, A, L, const INS: usize, const OUTS: usize> {
     _phantom: std::marker::PhantomData<(B, ES, BS)>,
 
     // params
+    concurrent_sims: usize,
     motor_dt: f32,
     brain_ticks_per_motor: u32,
 }
@@ -63,8 +64,16 @@ where
     A: AgentBrain<B, BS, INS, OUTS> + Clone,
     L: SimLogger<B, ES, BS, A>,
 {
-    pub fn new(env: E, brain: A, logger: L, motor_dt: f32, brain_ticks_per_motor: u32) -> Self {
+    pub fn new(
+        env: E,
+        brain: A,
+        logger: L,
+        motor_dt: f32,
+        brain_ticks_per_motor: u32,
+        concurrent_sims: usize,
+    ) -> Self {
         Self {
+            concurrent_sims,
             motor_dt,
             brain_ticks_per_motor,
             env,
@@ -80,9 +89,10 @@ where
         for generation in 0..generations {
             self.logger.record_brain(self.brain.clone(), generation);
 
-            self.env.reset(self.brain.batch_size());
+            self.env
+                .reset(self.brain.batch_size(), self.concurrent_sims);
 
-            let mut state = self.brain.init_state();
+            let mut state = self.brain.init_state(self.concurrent_sims);
 
             while !self.env.is_done() {
                 let inputs = self.env.get_sensors();

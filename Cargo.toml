@@ -1,3 +1,8 @@
 [workspace]
 members = ["mnist-sim", "sim-core", "viz-bevy"]
 resolver = "2"
+
+[workspace.dependencies]
+burn = { version = "0.20.1", features = ["fusion", "wgpu", "cuda"] }
+serde = { version = "1.0.228" }
+bevy = { version = "0.18.0" }
