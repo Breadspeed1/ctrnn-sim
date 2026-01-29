@@ -1,53 +1,72 @@
 use burn::{Tensor, prelude::Backend};
 
-pub trait AgentBrain<B: Backend, S> {
-    fn random(batch_size: usize, input_size: usize, output_size: usize, device: &B::Device)
-    -> Self;
+pub mod brain;
 
+// A -> num agents
+// N -> num neurons
+// B -> num parallel simulations
+// M -> actions
+// I -> inputs
+
+pub trait AgentBrain<B: Backend, S, const INS: usize, const OUTS: usize> {
     fn batch_size(&self) -> usize;
 
-    fn forward(&mut self, inputs: Tensor<B, 2>, dt: f32) -> Tensor<B, 2>;
+    /// inputs: [A, I, B]
+    /// return: [A, M, B]
+    fn forward(&mut self, inputs: Tensor<B, 3>, state: S, dt: f32) -> (Tensor<B, 3>, S);
 
-    fn mutate(&mut self, fitness: Tensor<B, 1>);
+    /// fitness: [A, B]
+    fn mutate(&mut self, fitness: Tensor<B, 2>);
 
-    fn get_state(&self) -> S;
+    fn init_state(&self) -> S;
 }
 
-pub trait Environment<B: Backend> {
+pub trait Environment<B: Backend, S, const INS: usize, const OUTS: usize> {
     fn input_size(&self) -> usize;
     fn output_size(&self) -> usize;
 
     fn reset(&mut self, batch_size: usize);
 
-    fn get_sensors(&self) -> Tensor<B, 2>;
+    fn get_sensors(&self) -> Tensor<B, 3>;
 
-    fn apply_motors(&mut self, motors: Tensor<B, 2>);
+    fn apply_motors(&mut self, motors: Tensor<B, 3>);
 
-    fn calculate_fitness(&self) -> Tensor<B, 1>;
+    fn calculate_fitness(&self) -> Tensor<B, 2>;
 
     fn is_done(&self) -> bool;
+
+    fn get_state(&self) -> S;
 }
 
-pub trait SimLogger<B: Backend> {
-    //TODO decide
+pub trait SimLogger<B: Backend, ES, BS, A> {
+    fn record_env(&mut self, state: ES, generation: usize);
+    fn record_ephemeral_brain(&mut self, state: BS, generation: usize);
+    fn record_brain(&mut self, brain: A, generation: usize);
 }
 
-pub struct Runner<B, S, E, A, L> {
+pub struct Runner<B, ES, BS, E, A, L, const INS: usize, const OUTS: usize> {
     env: E,
     brain: A,
     logger: L,
-    _phantom: std::marker::PhantomData<(B, S)>,
+    _phantom: std::marker::PhantomData<(B, ES, BS)>,
+
+    // params
+    motor_dt: f32,
+    brain_ticks_per_motor: u32,
 }
 
-impl<B, S, E, A, L> Runner<B, S, E, A, L>
+impl<B, ES, BS, E, A, L, const INS: usize, const OUTS: usize> Runner<B, ES, BS, E, A, L, INS, OUTS>
 where
+    BS: Clone,
     B: Backend,
-    E: Environment<B>,
-    A: AgentBrain<B, S>,
-    L: SimLogger<B>,
+    E: Environment<B, ES, INS, OUTS>,
+    A: AgentBrain<B, BS, INS, OUTS> + Clone,
+    L: SimLogger<B, ES, BS, A>,
 {
-    pub fn new(env: E, brain: A, logger: L) -> Self {
+    pub fn new(env: E, brain: A, logger: L, motor_dt: f32, brain_ticks_per_motor: u32) -> Self {
         Self {
+            motor_dt,
+            brain_ticks_per_motor,
             env,
             brain,
             logger,
@@ -56,18 +75,38 @@ where
     }
 
     pub fn evolve(&mut self, generations: usize) {
+        let brain_dt = self.motor_dt / self.brain_ticks_per_motor as f32;
+
         for generation in 0..generations {
+            self.logger.record_brain(self.brain.clone(), generation);
+
             self.env.reset(self.brain.batch_size());
+
+            let mut state = self.brain.init_state();
 
             while !self.env.is_done() {
                 let inputs = self.env.get_sensors();
 
-                let motors = self.brain.forward(inputs, 0.1);
+                // do n - 1 brain loops
+                for _ in 0..(self.brain_ticks_per_motor - 1) {
+                    let (_, new_state) = self.brain.forward(inputs.clone(), state, brain_dt);
+                    state = new_state;
+                    self.logger
+                        .record_ephemeral_brain(state.clone(), generation);
+                }
+
+                // one more brain loop and take motor functions
+                let (motors, new_state) = self.brain.forward(inputs, state, brain_dt);
+                state = new_state;
+                self.logger
+                    .record_ephemeral_brain(state.clone(), generation);
 
                 self.env.apply_motors(motors);
             }
 
             let fitness = self.env.calculate_fitness();
+
+            self.logger.record_env(self.env.get_state(), generation);
 
             self.brain.mutate(fitness);
 
