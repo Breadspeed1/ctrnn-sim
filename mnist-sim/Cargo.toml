@@ -7,3 +7,5 @@ edition = "2024"
 burn = { workspace = true, features = ["ndarray"] }
 mnist = "0.6.0"
 sim-core = { path = "../sim-core" }
+ratatui = "0.29.0"
+crossterm = "0.28.1"

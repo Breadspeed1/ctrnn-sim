@@ -3567,7 +3567,9 @@ name = "mnist-sim"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "crossterm",
  "mnist",
+ "ratatui",
  "sim-core",
 ]
 
