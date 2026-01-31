@@ -274,11 +274,12 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use burn::backend::cuda::{Cuda, CudaDevice};
+    use burn::backend::Wgpu;
+    use burn::backend::cuda::CudaDevice;
+    use burn::backend::wgpu::WgpuDevice;
     use burn::tensor::Distribution;
 
-    // Use the NdArray backend for fast CPU testing
-    type TestBackend = Cuda;
+    type TestBackend = Wgpu;
 
     const BATCH: usize = 250;
     const NEURONS: usize = 250;
@@ -324,7 +325,7 @@ mod tests {
 
     #[test]
     fn bench() {
-        let device = CudaDevice::default();
+        let device = WgpuDevice::default();
 
         let mut brain = create_test_brain(&device);
         let mut state = <CtrnnBrain<TestBackend> as AgentBrain<
@@ -391,7 +392,7 @@ mod tests {
     fn test_forward_step_integration() {
         let device = Default::default();
         let mut brain = create_test_brain(&device);
-        let mut state = <CtrnnBrain<TestBackend> as AgentBrain<
+        let state = <CtrnnBrain<TestBackend> as AgentBrain<
             TestBackend,
             CtrnnState<TestBackend>,
             INS,
