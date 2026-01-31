@@ -42,6 +42,7 @@ pub trait SimLogger<B: Backend, ES, BS, A> {
     fn record_env(&mut self, state: ES, generation: usize);
     fn record_ephemeral_brain(&mut self, state: BS, generation: usize);
     fn record_brain(&mut self, brain: A, generation: usize);
+    fn record_fitness(&mut self, fitness: Tensor<B, 2>, generation: usize);
 }
 
 pub struct Runner<B, ES, BS, E, A, L, const INS: usize, const OUTS: usize> {
@@ -117,6 +118,7 @@ where
             }
 
             let fitness = self.env.calculate_fitness();
+            self.logger.record_fitness(fitness.clone(), generation);
 
             self.brain.mutate(fitness);
         }

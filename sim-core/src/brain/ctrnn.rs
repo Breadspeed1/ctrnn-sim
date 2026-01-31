@@ -10,21 +10,21 @@ use crate::AgentBrain;
 #[derive(Clone)]
 pub struct CtrnnBrain<B: Backend, const INS: usize, const OUTS: usize> {
     /// [A, N, N]
-    weights: Tensor<B, 3>,
+    pub weights: Tensor<B, 3>,
 
     /// [A, N]
-    taus: Tensor<B, 2>,
+    pub taus: Tensor<B, 2>,
 
     /// [A, N]
-    biases: Tensor<B, 2>,
+    pub biases: Tensor<B, 2>,
 
     /// [A, N]
-    active_mask: Tensor<B, 2>,
+    pub active_mask: Tensor<B, 2>,
 
     /// [A, N]
-    non_input_mask: Tensor<B, 2>,
+    pub non_input_mask: Tensor<B, 2>,
 
-    mutation_config: MutationConfig,
+    pub mutation_config: MutationConfig,
 }
 
 #[derive(Clone)]
@@ -38,7 +38,7 @@ pub struct MutationConfig {
 #[derive(Clone)]
 pub struct CtrnnState<B: Backend> {
     // [A, N, B]
-    states: Tensor<B, 3>,
+    pub states: Tensor<B, 3>,
 }
 
 impl Default for MutationConfig {
@@ -76,11 +76,12 @@ impl<B: Backend, const INS: usize, const OUTS: usize> CtrnnBrain<B, INS, OUTS> {
         // 3. TAUS (1.0)
         let taus = Tensor::ones(shape_2d.clone(), device);
 
-        // 4. ACTIVE MASK (Inputs + Outputs initially)
+        // 4. ACTIVE MASK (Inputs + Outputs + some hidden initially)
+        let initial_hidden = 10.min(num_neurons - (INS + OUTS));
         let mut active_mask = Tensor::zeros(shape_2d.clone(), device);
         active_mask = active_mask.slice_assign(
-            [0..batch_size, 0..(INS + OUTS)],
-            Tensor::ones([batch_size, INS + OUTS], device),
+            [0..batch_size, 0..(INS + OUTS + initial_hidden)],
+            Tensor::ones([batch_size, INS + OUTS + initial_hidden], device),
         );
 
         // 5. NON-INPUT MASK (Everything except inputs)
@@ -98,6 +99,10 @@ impl<B: Backend, const INS: usize, const OUTS: usize> CtrnnBrain<B, INS, OUTS> {
             non_input_mask,
             mutation_config,
         }
+    }
+
+    pub fn num_neurons(&self) -> usize {
+        self.weights.dims()[1]
     }
 }
 
@@ -189,11 +194,18 @@ impl<B: Backend, const INS: usize, const OUTS: usize> AgentBrain<B, CtrnnState<B
         let scores_vec: Vec<f32> = scores_data.as_slice::<f32>().unwrap().to_vec();
 
         // 3. ArgSort: Create (Index, Score) pairs and sort descending
+        // Handle NaN values by treating them as worst (negative infinity)
         let mut indices: Vec<usize> = (0..batch_size).collect();
         indices.sort_by(|&a, &b| {
-            scores_vec[b]
-                .partial_cmp(&scores_vec[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let sa = scores_vec[a];
+            let sb = scores_vec[b];
+            // Treat NaN as worst possible score
+            match (sa.is_nan(), sb.is_nan()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater, // NaN is worse, goes later
+                (false, true) => std::cmp::Ordering::Less,    // Non-NaN is better
+                (false, false) => sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal),
+            }
         });
 
         // 4. Create Parent Mapping
@@ -227,13 +239,23 @@ impl<B: Backend, const INS: usize, const OUTS: usize> AgentBrain<B, CtrnnState<B
         let parent_indices = Tensor::from_ints(sorted_parent_indices.as_slice(), &device);
 
         // --- PHASE 2: CLONING ---
+        // Save the elite weights before ANY mutation (strict elitism)
+        // Use indices[0..num_elites] directly (the actual best agent indices in original population)
+        let elite_indices_vec: Vec<i32> =
+            indices[0..num_elites].iter().map(|&i| i as i32).collect();
+        let elite_indices = Tensor::from_ints(elite_indices_vec.as_slice(), &device);
+        let elite_weights = self.weights.clone().select(0, elite_indices.clone());
+        let elite_biases = self.biases.clone().select(0, elite_indices.clone());
+        let elite_taus = self.taus.clone().select(0, elite_indices.clone());
+        let elite_active_mask = self.active_mask.clone().select(0, elite_indices.clone());
+        let elite_non_input_mask = self.non_input_mask.clone().select(0, elite_indices);
 
-        // Overwrite self tensors with the sorted/cloned versions
+        // CRITICAL: Overwrite ALL agents with elite-sourced clones BEFORE mutation
+        // This ensures non-elites become mutated copies of elites, not mutated versions of themselves.
         self.weights = self.weights.clone().select(0, parent_indices.clone());
         self.biases = self.biases.clone().select(0, parent_indices.clone());
         self.taus = self.taus.clone().select(0, parent_indices.clone());
         self.active_mask = self.active_mask.clone().select(0, parent_indices.clone());
-        // non_input_mask follows the agent structure
         self.non_input_mask = self
             .non_input_mask
             .clone()
@@ -309,6 +331,31 @@ impl<B: Backend, const INS: usize, const OUTS: usize> AgentBrain<B, CtrnnState<B
         self.active_mask = self.active_mask.clone() + new_nodes;
         // Clamp to 1.0 just in case
         self.active_mask = self.active_mask.clone().clamp(0.0, 1.0);
+
+        // D. Clamp parameters for stability
+        self.weights = self.weights.clone().clamp(-3.0, 3.0);
+        self.biases = self.biases.clone().clamp(-3.0, 3.0);
+        self.taus = self.taus.clone().clamp(0.1, 5.0); // Prevent div-by-zero and extreme slowness
+
+        // --- PHASE 4: REINSTATE ELITES ---
+        // Overwrite the first num_elites agents with their original, unmutatedselves
+        self.weights = self
+            .weights
+            .clone()
+            .slice_assign([0..num_elites], elite_weights);
+        self.biases = self
+            .biases
+            .clone()
+            .slice_assign([0..num_elites], elite_biases);
+        self.taus = self.taus.clone().slice_assign([0..num_elites], elite_taus);
+        self.active_mask = self
+            .active_mask
+            .clone()
+            .slice_assign([0..num_elites], elite_active_mask);
+        self.non_input_mask = self
+            .non_input_mask
+            .clone()
+            .slice_assign([0..num_elites], elite_non_input_mask);
     }
 
     fn init_state(&self, par_sims: usize) -> CtrnnState<B> {

@@ -1,3 +1,4 @@
+pub mod tui_logger;
 use burn::{
     prelude::Backend,
     tensor::{Distribution, Int, Tensor},
@@ -27,6 +28,9 @@ pub struct MnistEnvironment<B: Backend, const N: usize> {
     // Simulation Parameters
     max_steps: usize,
     velocity_scale: f32,
+
+    // Fixed validation set (initialized on first reset, reused every generation)
+    fixed_digits: Option<Tensor<B, 1, Int>>, // [S]
 
     // Current State
     positions: Tensor<B, 3>,          // [A, S, 2]
@@ -81,6 +85,7 @@ impl<B: Backend, const N: usize> MnistEnvironment<B, N> {
             labels,
             max_steps,
             velocity_scale,
+            fixed_digits: None, // Will be initialized on first reset()
             positions: Tensor::zeros([1, 1, 2], device),
             active_digits: Tensor::zeros([1], device),
             fitness: Tensor::zeros([1, 1], device),
@@ -127,11 +132,17 @@ impl<B: Backend, const N: usize> Environment<B, MnistSimState<B>, N, { MNIST_OUT
     fn reset(&mut self, batch_size: usize, concurrent_sims: usize) {
         let device = self.images.device();
 
-        self.active_digits = Tensor::<B, 1, Int>::random(
-            [concurrent_sims],
-            Distribution::Uniform(0.0, 60000.0),
-            &device,
-        );
+        // Initialize fixed_digits on first call, reuse thereafter for comparable fitness
+        if self.fixed_digits.is_none()
+            || self.fixed_digits.as_ref().unwrap().dims()[0] != concurrent_sims
+        {
+            self.fixed_digits = Some(Tensor::<B, 1, Int>::random(
+                [concurrent_sims],
+                Distribution::Uniform(0.0, 60000.0),
+                &device,
+            ));
+        }
+        self.active_digits = self.fixed_digits.clone().unwrap();
 
         // Cache active images [S, 28, 28]
         self.active_images = self.images.clone().select(0, self.active_digits.clone());
@@ -242,12 +253,59 @@ impl<B: Backend, const N: usize> Environment<B, MnistSimState<B>, N, { MNIST_OUT
             .select(0, active_digits_broad.flatten::<1>(0, 1))
             .reshape([batch_size, concurrent_sims]);
 
-        let correct = predictions.equal(targets).float();
+        let correct = predictions.equal(targets.clone()).float();
+
+        // 1. Soft Reward: Logit of the target class (encourages confidence)
+        // Logits: [A, 10, S], targets: [A, S]
+        // We want to pick the logit corresponding to the target for each agent/sim.
+        let target_logits = logits
+            .clone()
+            .gather(1, targets.unsqueeze_dim(1))
+            .squeeze_dim(1);
+
+        // 2. Exploration Reward: Reward movement and proximity to "ink"
+        // Get pixel value at current position
+        let [batch_size, concurrent_sims, _] = self.positions.dims();
+        let ix = self
+            .positions
+            .clone()
+            .slice([0..batch_size, 0..concurrent_sims, 0..1])
+            .round()
+            .int()
+            .clamp(0, 27);
+        let iy = self
+            .positions
+            .clone()
+            .slice([0..batch_size, 0..concurrent_sims, 1..2])
+            .round()
+            .int()
+            .clamp(0, 27);
+        let device = self.images.device();
+        let s_idx = Tensor::<B, 1, Int>::arange(0..concurrent_sims as i64, &device)
+            .unsqueeze_dim::<2>(0)
+            .repeat_dim(0, batch_size);
+        let flat_img_idx = s_idx * (28 * 28) + iy.squeeze_dim(2) * 28 + ix.squeeze_dim(2);
+        let pixel_values = self
+            .active_images
+            .clone()
+            .flatten::<1>(0, 2)
+            .select(0, flat_img_idx.flatten::<1>(0, 1))
+            .reshape([batch_size, concurrent_sims]);
+
+        // Reward being over "ink" (pixels > 0.1)
+        let ink_reward = pixel_values.greater_elem(0.1).float() * 0.01;
 
         self.step_count += 1;
         let weight = self.step_count as f32 / self.max_steps as f32;
 
-        self.fitness = self.fitness.clone() + correct * weight;
+        // Total Fitness Update
+        // We add:
+        // - Binary correct (weighted by time)
+        // - Soft target logit (confidence)
+        // - Ink reward (exploration incentive)
+        self.fitness =
+            self.fitness.clone() + (correct * 1.0 + target_logits * 0.1 + ink_reward) * weight;
+
         self.last_logits = logits;
 
         if self.step_count >= self.max_steps {
