@@ -1,1 +1,4 @@
 /target
+mnist-sim/target/*
+sim-core/target/*
+viz-bevy/target/*
