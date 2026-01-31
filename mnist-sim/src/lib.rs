@@ -13,8 +13,10 @@ pub struct MnistSimState<B: Backend> {
     pub active_digits: Tensor<B, 1, Int>, // [S]
     pub fitness: Tensor<B, 2>,            // [A, S]
     pub step_count: usize,
-    pub last_logits: Tensor<B, 3>, // [A, 10, S]
-    pub labels: Tensor<B, 1, Int>, // [S]
+    pub last_logits: Tensor<B, 3>,   // [A, 10, S]
+    pub labels: Tensor<B, 1, Int>,   // [S]
+    pub sensors: Tensor<B, 3>,       // [A, INS, S]
+    pub active_images: Tensor<B, 3>, // [S, 28, 28]
 }
 
 pub struct MnistEnvironment<B: Backend, const N: usize> {
@@ -32,7 +34,8 @@ pub struct MnistEnvironment<B: Backend, const N: usize> {
     fitness: Tensor<B, 2>,            // [A, S]
     step_count: usize,
     done: bool,
-    last_logits: Tensor<B, 3>, // [A, 10, S]
+    last_logits: Tensor<B, 3>,   // [A, 10, S]
+    active_images: Tensor<B, 3>, // [S, 28, 28]
 }
 
 impl<B: Backend, const N: usize> MnistEnvironment<B, N> {
@@ -84,6 +87,28 @@ impl<B: Backend, const N: usize> MnistEnvironment<B, N> {
             step_count: 0,
             done: true,
             last_logits: Tensor::zeros([1, 10, 1], device),
+            active_images: Tensor::zeros([1, 28, 28], device),
+        }
+    }
+
+    pub fn get_images_for_tui(&self) -> Tensor<B, 3> {
+        self.images.clone()
+    }
+
+    pub fn get_state(&self) -> MnistSimState<B> {
+        self.get_state_inner()
+    }
+
+    fn get_state_inner(&self) -> MnistSimState<B> {
+        MnistSimState {
+            positions: self.positions.clone(),
+            active_digits: self.active_digits.clone(),
+            fitness: self.fitness.clone(),
+            step_count: self.step_count,
+            last_logits: self.last_logits.clone(),
+            labels: self.labels.clone().select(0, self.active_digits.clone()),
+            sensors: self.get_sensors(),
+            active_images: self.active_images.clone(),
         }
     }
 }
@@ -102,12 +127,14 @@ impl<B: Backend, const N: usize> Environment<B, MnistSimState<B>, N, { MNIST_OUT
     fn reset(&mut self, batch_size: usize, concurrent_sims: usize) {
         let device = self.images.device();
 
-        // Randomly select digits for each parallel simulation index (synchronous across agents)
         self.active_digits = Tensor::<B, 1, Int>::random(
             [concurrent_sims],
             Distribution::Uniform(0.0, 60000.0),
             &device,
         );
+
+        // Cache active images [S, 28, 28]
+        self.active_images = self.images.clone().select(0, self.active_digits.clone());
 
         // Start at center (14, 14)
         self.positions = Tensor::full([batch_size, concurrent_sims, 2], 14.0, &device);
@@ -144,30 +171,32 @@ impl<B: Backend, const N: usize> Environment<B, MnistSimState<B>, N, { MNIST_OUT
                     .squeeze_dim(2)
                     + dy as f32;
 
-                let ix = x.clone().round().int();
-                let iy = y.clone().round().int();
+                let ix = x.clone().round().int().clamp(0, 27);
+                let iy = y.clone().round().int().clamp(0, 27);
 
-                let in_bounds = ix
+                let in_bounds = x
                     .clone()
-                    .greater_equal_elem(0)
-                    .bool_and(ix.clone().lower_elem(28))
-                    .bool_and(iy.clone().greater_equal_elem(0))
-                    .bool_and(iy.clone().lower_elem(28));
+                    .greater_equal_elem(0.0)
+                    .bool_and(x.clone().lower_elem(27.5))
+                    .bool_and(y.clone().greater_equal_elem(0.0))
+                    .bool_and(y.clone().lower_elem(27.5));
 
-                // Index into images: self.active_digits is [S], we need to broadcast to [A, S]
-                let active_digits_broad = self
-                    .active_digits
-                    .clone()
+                // Index into active_images: [S, 28, 28]
+                // We need pixels for each simulation index S
+                // iy and ix are [A, S], in_bounds is [A, S]
+                let s_idx = Tensor::<B, 1, Int>::arange(0..concurrent_sims as i64, &device)
                     .unsqueeze_dim::<2>(0)
                     .repeat_dim(0, batch_size);
-                let flat_img_idx = active_digits_broad * (28 * 28) + iy * 28 + ix;
+
+                let flat_img_idx = s_idx * (28 * 28) + iy * 28 + ix;
 
                 let pixels = self
-                    .images
+                    .active_images
                     .clone()
                     .flatten::<1>(0, 2)
                     .select(0, flat_img_idx.flatten::<1>(0, 1))
                     .reshape([batch_size, concurrent_sims]);
+
                 let masked_pixels = pixels.mask_where(
                     in_bounds.bool_not(),
                     Tensor::full([batch_size, concurrent_sims], -1.0, &device),
@@ -235,14 +264,7 @@ impl<B: Backend, const N: usize> Environment<B, MnistSimState<B>, N, { MNIST_OUT
     }
 
     fn get_state(&self) -> MnistSimState<B> {
-        MnistSimState {
-            positions: self.positions.clone(),
-            active_digits: self.active_digits.clone(),
-            fitness: self.fitness.clone(),
-            step_count: self.step_count,
-            last_logits: self.last_logits.clone(),
-            labels: self.labels.clone().select(0, self.active_digits.clone()),
-        }
+        self.get_state_inner()
     }
 }
 
