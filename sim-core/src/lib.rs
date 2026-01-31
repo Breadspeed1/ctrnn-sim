@@ -112,15 +112,13 @@ where
                     .record_ephemeral_brain(state.clone(), generation);
 
                 self.env.apply_motors(motors);
+
+                self.logger.record_env(self.env.get_state(), generation);
             }
 
             let fitness = self.env.calculate_fitness();
 
-            self.logger.record_env(self.env.get_state(), generation);
-
             self.brain.mutate(fitness);
-
-            todo!("logging")
         }
     }
 }

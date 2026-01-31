@@ -7,6 +7,7 @@ use crate::AgentBrain;
 // B -> num parallel simulations
 // I -> num inputs
 
+#[derive(Clone)]
 pub struct CtrnnBrain<B: Backend, const INS: usize, const OUTS: usize> {
     /// [A, N, N]
     weights: Tensor<B, 3>,
@@ -26,6 +27,7 @@ pub struct CtrnnBrain<B: Backend, const INS: usize, const OUTS: usize> {
     mutation_config: MutationConfig,
 }
 
+#[derive(Clone)]
 pub struct MutationConfig {
     pub survival_rate: f32,
     pub mutation_rate: f32,
@@ -33,6 +35,7 @@ pub struct MutationConfig {
     pub node_add_prob: f32,
 }
 
+#[derive(Clone)]
 pub struct CtrnnState<B: Backend> {
     // [A, N, B]
     states: Tensor<B, 3>,
